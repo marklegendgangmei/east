@@ -1,123 +1,134 @@
 <script>
-    (function(){
-      const { createFFmpeg, fetchFile } = FFmpeg;
-      const ffmpeg = createFFmpeg({ log: true });
-      let currentFile = null;
-      let busy = false;
-      let canceled = false;
+    // Elements
+    const drop = document.getElementById('drop');
+    const fileInput = document.getElementById('fileInput');
+    const convertBtn = document.getElementById('convertBtn');
+    const cancelBtn = document.getElementById('cancelBtn');
+    const bitrateEl = document.getElementById('bitrate');
+    const progressWrap = document.getElementById('progressWrap');
+    const progressBar = document.getElementById('progressBar');
+    const statusText = document.getElementById('statusText');
+    const resultDiv = document.getElementById('result');
+    const downloadLink = document.getElementById('downloadLink');
+    const audioPreview = document.getElementById('audioPreview');
 
-      const dropzone = document.getElementById('dropzone');
-      const fileInput = document.getElementById('fileInput');
-      const selectBtn = document.getElementById('selectBtn');
-      const fileNameEl = document.getElementById('fileName');
-      const fileSizeEl = document.getElementById('fileSize');
-      const info = document.getElementById('info');
-      const startBtn = document.getElementById('startBtn');
-      const downloadLink = document.getElementById('downloadLink');
-      const cancelBtn = document.getElementById('cancelBtn');
-      const decodeBar = document.getElementById('decodeBar');
-      const encodeBar = document.getElementById('encodeBar');
+    let selectedFile = null;
+    let ffmpeg = null;
+    let abortRequested = false;
 
-      function humanSize(bytes){
-        const units = ['B','KB','MB','GB'];
-        let i=0; while(bytes>=1024 && i<units.length-1){ bytes/=1024; i++; }
-        return bytes.toFixed(2) + ' ' + units[i];
+    // Drag/drop
+    drop.addEventListener('click', () => fileInput.click());
+    drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('dragover'); });
+    drop.addEventListener('dragleave', e => { e.preventDefault(); drop.classList.remove('dragover'); });
+    drop.addEventListener('drop', e => {
+      e.preventDefault(); drop.classList.remove('dragover');
+      const f = e.dataTransfer.files[0];
+      handleFileSelection(f);
+    });
+
+    fileInput.addEventListener('change', (e) => handleFileSelection(e.target.files[0]));
+
+    function handleFileSelection(file) {
+      if (!file) return;
+      selectedFile = file;
+      drop.querySelector('p').textContent = `Selected: ${file.name} (${Math.round(file.size/1024/1024*100)/100} MB)`;
+      resultDiv.classList.add('d-none');
+    }
+
+    // Load ffmpeg lazily
+    async function ensureFFmpeg() {
+      if (ffmpeg) return ffmpeg;
+      if (!window.FFmpeg || !window.FFmpeg.createFFmpeg) {
+        throw new Error('FFmpeg library not loaded. Check your internet connection and the CDN.');
+      }
+      ffmpeg = window.FFmpeg.createFFmpeg({ log: true });
+      ffmpeg.setProgress(({ ratio }) => {
+        const pct = Math.min(100, Math.round(ratio * 100));
+        progressBar.style.width = pct + '%';
+        progressBar.textContent = pct + '%';
+        statusText.textContent = `FFmpeg progress: ${pct}%`;
+      });
+      statusText.textContent = 'Loading FFmpeg (this may take a few seconds)...';
+      await ffmpeg.load();
+      return ffmpeg;
+    }
+
+    convertBtn.addEventListener('click', async () => {
+      if (!selectedFile) return alert('Please pick an MP4 file first.');
+      if (!selectedFile.type.startsWith('video') && !selectedFile.name.endsWith('.mp4')) {
+        if (!confirm('Selected file does not appear to be an MP4. Continue anyway?')) return;
       }
 
-      function setProgressBar(el, pct){
-        const val = Math.max(0, Math.min(100, Math.round(pct*100)));
-        el.style.width = val + '%';
-        el.textContent = val + '%';
+      convertBtn.disabled = true;
+      cancelBtn.disabled = false;
+      progressWrap.classList.remove('d-none');
+      progressBar.style.width = '0%';
+      progressBar.textContent = '0%';
+      statusText.textContent = 'Preparing...';
+      abortRequested = false;
+
+      try {
+        await ensureFFmpeg();
+
+        const inName = 'input.mp4';
+        const outName = 'output.mp3';
+        const bitrate = bitrateEl.value || '128k';
+
+        statusText.textContent = 'Reading file into virtual FS...';
+        const data = await fetchFileFromBlob(selectedFile);
+        ffmpeg.FS('writeFile', inName, data);
+
+        statusText.textContent = 'Running conversion...';
+
+        // Basic command: extract audio and encode to mp3
+        // -y overwrite, -i input, -vn no video, -ab audio bitrate, -map a map audio
+        await ffmpeg.run('-y', '-i', inName, '-vn', '-ab', bitrate, '-map', 'a', outName);
+
+        statusText.textContent = 'Reading output file...';
+        const outData = ffmpeg.FS('readFile', outName);
+        const blob = new Blob([outData.buffer], { type: 'audio/mpeg' });
+        const url = URL.createObjectURL(blob);
+
+        downloadLink.href = url;
+        downloadLink.download = (selectedFile.name.replace(/\.[^.]+$/, '') || 'converted') + '.mp3';
+        downloadLink.textContent = 'Download MP3 (' + Math.round(blob.size/1024) + ' KB)';
+        audioPreview.src = url;
+
+        resultDiv.classList.remove('d-none');
+        statusText.textContent = 'Conversion complete.';
+
+      } catch (err) {
+        console.error(err);
+        alert('Conversion failed: ' + err.message);
+        statusText.textContent = 'Error: ' + (err.message || err);
+      } finally {
+        convertBtn.disabled = false;
+        cancelBtn.disabled = true;
       }
+    });
 
-      dropzone.addEventListener('dragover', (e)=>{ e.preventDefault(); dropzone.classList.add('dragover'); });
-      dropzone.addEventListener('dragleave', ()=> dropzone.classList.remove('dragover'));
-      dropzone.addEventListener('drop', (e)=>{
-        e.preventDefault(); dropzone.classList.remove('dragover');
-        const f = e.dataTransfer.files && e.dataTransfer.files[0];
-        if(f) handleFile(f);
-      });
+    cancelBtn.addEventListener('click', () => {
+      // ffmpeg.wasm doesn't support aborting runs reliably in older builds; this sets a flag.
+      abortRequested = true;
+      statusText.textContent = 'Abort requested (may take a moment)...';
+    });
 
-      selectBtn.addEventListener('click', ()=> fileInput.click());
-      fileInput.addEventListener('change', ()=>{
-        const f = fileInput.files && fileInput.files[0]; if(f) handleFile(f);
-      });
+    // Helper: convert File/Blob to Uint8Array using fetch-file helper if available
+    async function fetchFileFromBlob(blob) {
+      // If FFmpeg's fetchFile helper is available, use it, else fallback
+      if (window.FFmpeg && window.FFmpeg.fetchFile) return window.FFmpeg.fetchFile(blob);
+      // fallback
+      const arr = await blob.arrayBuffer();
+      return new Uint8Array(arr);
+    }
 
-      function handleFile(file){
-        currentFile = file;
-        fileNameEl.textContent = file.name;
-        fileSizeEl.textContent = humanSize(file.size);
-        info.classList.remove('hidden');
-        startBtn.disabled = false;
-        downloadLink.classList.add('hidden');
+    // Small usability: support paste of a URL? Not in this simple demo.
+
+    // Initial small check
+    (function checkSupport(){
+      if (!window.fetch || !window.Blob) {
+        alert('Your browser is very old and may not support this demo. Use Chrome, Edge or Firefox (desktop).');
       }
-
-      startBtn.addEventListener('click', async ()=>{
-        if(!currentFile || busy) return;
-        canceled = false;
-        busy = true;
-        startBtn.disabled = true;
-        cancelBtn.classList.remove('hidden');
-        decodeBar.style.width = '0%'; encodeBar.style.width = '0%';
-
-        try{
-          if(!ffmpeg.isLoaded()){
-            // load wasm; this may take a few seconds on first run
-            await ffmpeg.load();
-          }
-
-          // write file to FS
-          ffmpeg.FS('writeFile','input.mp4', await fetchFile(currentFile));
-
-          // First pass: demux audio to WAV (decoding stage)
-          ffmpeg.setProgress(({ratio})=>{
-            // during this run ratio is only for current command; we map to decoding bar
-            setProgressBar(decodeBar, ratio);
-          });
-          // Run demux: -vn removes video, output wav (PCM) to keep quality
-          await ffmpeg.run('-i','input.mp4','-vn','-acodec','pcm_s16le','-ar','44100','-ac','2','output.wav');
-          if(canceled) throw new Error('Canceled');
-
-          // Second pass: encode WAV -> MP3 (encoding stage)
-          ffmpeg.setProgress(({ratio})=>{
-            setProgressBar(encodeBar, ratio);
-          });
-          // libmp3lame quality option qscale:a 2 => good quality; you can tune it
-          await ffmpeg.run('-i','output.wav','-codec:a','libmp3lame','-qscale:a','2','output.mp3');
-          if(canceled) throw new Error('Canceled');
-
-          // read the result
-          const data = ffmpeg.FS('readFile','output.mp3');
-          const blob = new Blob([data.buffer], { type: 'audio/mpeg' });
-          const url = URL.createObjectURL(blob);
-          downloadLink.href = url;
-          downloadLink.download = (currentFile.name.replace(/\.[^/.]+$/, '') || 'output') + '.mp3';
-          downloadLink.classList.remove('hidden');
-        }catch(err){
-          if(err.message && err.message.includes('Canceled')){
-            alert('Conversion canceled.');
-          }else{
-            console.error(err);
-            alert('Error during conversion: ' + (err.message||err));
-          }
-        }finally{
-          busy = false;
-          startBtn.disabled = false;
-          cancelBtn.classList.add('hidden');
-          // clean up FS to free memory
-          try{ ffmpeg.FS('unlink','input.mp4'); }catch(e){}
-          try{ ffmpeg.FS('unlink','output.wav'); }catch(e){}
-          try{ ffmpeg.FS('unlink','output.mp3'); }catch(e){}
-        }
-      });
-
-      cancelBtn.addEventListener('click', ()=>{
-        if(!busy) return;
-        canceled = true;
-        // Note: ffmpeg.wasm currently does not have a graceful cancel API for running command.
-        // This sets a flag and user will be informed when next await returns/throws.
-        cancelBtn.classList.add('hidden');
-      });
-
     })();
+
   </script>
